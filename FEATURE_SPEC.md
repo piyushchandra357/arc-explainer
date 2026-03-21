@@ -1,138 +1,132 @@
-# ARC Explainer: Comprehensive Feature Specification Document
+# ARC Explainer: In-Depth Feature Specification Document
 
 ## 1. Executive Summary
 
-**Mission:** ARC Explainer is a comprehensive, full-stack platform built as a personal research suite for the Abstract Reasoning Corpus for Artificial General Intelligence (ARC-AGI). Designed by a video game producer, its primary goal is not to "solve" ARC but to provide an exhaustive set of tools for researchers to analyze, explore, debate, and benchmark AI agents (such as OpenAI's o-series, Claude 3.5 Sonnet, xAI Grok-4, Google Gemini, and OpenRouter models) working on the benchmark.
+**Mission:** ARC Explainer is a full-stack platform built as a personal research suite for the Abstract Reasoning Corpus for Artificial General Intelligence (ARC-AGI). Its goal is to provide an exhaustive set of tools for researchers to analyze, explore, debate, and benchmark AI agents (e.g., OpenAI's o-series, Claude 3.5 Sonnet, xAI Grok-4, OpenRouter models).
 
 **Core Philosophies:**
-- **Database-First Execution:** Everything rendered in the UI must exist in PostgreSQL. State is synchronized via DB reads rather than relying on ephemeral API responses.
-- **Single Responsibility Principle (SRP) & DRY:** Distinct repositories and services segregate logic (e.g., Accuracy, Trustworthiness, Cost, Metrics, and SnakeBench).
-- **Transparency & Verifiability:** AI reasoning is preserved explicitly (via conversation chaining and raw response storage). AI costs and token metrics are comprehensively tracked.
-- **Multi-Domain Platform:** Supports ARC1/2/3 grids, the RE-ARC Bench generative tasks suite, and Worm Arena (SnakeBench), treating general visual reasoning and classic environment benchmarks seamlessly.
+- **Database-First Execution:** Every UI element must represent existing PostgreSQL data. Temporary API states are not rendered; UI components re-fetch after DB writes.
+- **Single Responsibility Principle (SRP) & DRY:** Logic is tightly segregated. Repositories (Accuracy, Trustworthiness, Cost, Metrics, SnakeBench sub-repos) solely own their SQL.
+- **Multi-Domain Platform:** Supports classical ARC1/2/3 grids, the generative RE-ARC Bench tasks, and Worm Arena (SnakeBench environment testing), effectively treating diverse AI tests seamlessly.
 
 ---
 
-## 2. System Architecture
+## 2. System Architecture & Internal Workings
 
 ### 2.1 Technology Stack
-- **Frontend:** React 18, TypeScript, Vite, Wouter (Routing), TanStack Query, TailwindCSS, `shadcn/ui` and `DaisyUI` components.
+- **Frontend:** React 18, TypeScript, Vite, Wouter (Routing), TanStack Query, TailwindCSS, `shadcn/ui`, `DaisyUI`.
 - **Backend:** Node.js, Express.js, TypeScript (ESM).
 - **Database:** PostgreSQL accessed via Drizzle ORM (with in-memory fallback).
-- **AI Integrations:** Unified `BaseAIService` abstracting multiple APIs (OpenAI Responses API, Anthropic, Google Gemini, xAI/Grok, DeepSeek, OpenRouter).
-- **Solvers & Scripts:** Python sub-processes for solvers like Saturn, Grover, Poetiq, Beetree, and SnakeBench.
-- **Real-time / Streaming:** Server-Sent Events (SSE) and WebSockets for token-by-token analysis streams and live Worm Arena matches.
+- **AI Integrations:** Unified `BaseAIService` abstracting multiple APIs (OpenAI Responses API, Anthropic, Google Gemini, xAI/Grok, OpenRouter).
+- **Subprocesses:** Dedicated `PythonBridge` orchestrates execution of Python-based reasoning models and visual solvers (Saturn, Grover, Poetiq, Beetree, SnakeBench).
+- **Real-time / Streaming:** Server-Sent Events (SSE) and WebSockets handle token-by-token text generation and frame-by-frame game live streams.
 
-### 2.2 Domain Segregation (Server-Side)
-- **Repositories:** `AccuracyRepository`, `CostRepository`, `TrustworthinessRepository`, `MetricsRepository`, `ExplanationRepository`, and dedicated Worm Arena Repositories (`GameReadRepository`, `GameWriteRepository`, `LeaderboardRepository`, `CurationRepository`, `AnalyticsRepository`).
-- **Services:** `puzzleAnalysisService`, `streaming/analysisStreamService`, `snakeBenchService`, `reArcService`, `WormArenaReportService`, and specialized AI Provider services.
-- **Python Bridge:** Orchestrates execution of Python-based reasoning models and visual solvers (`pythonBridge.ts`).
+### 2.2 Python Subprocess Integration (`pythonBridge.ts`)
+The `PythonBridge` is the foundational layer for integrating heavy computational or Python-specific AI models.
+* **Protocol:** Communication happens over `stdin`/`stdout` using NDJSON (Newline Delimited JSON).
+* **Execution Flow:**
+    * Node spawns a child process (e.g., `saturn_wrapper.py`, `beetree_wrapper.py`).
+    * Node pushes initial configurations and contexts via `stdin`.
+    * Python streams output back. Events can include `{type: 'start'}`, `{type: 'progress'}`, `{type: 'log'}`, and `{type: 'final'}`.
+    * Node captures the final JSON block, aggregates verbose logs (stderr + stdout buffer), and fulfills the HTTP/SSE request to the client.
+* **UTF-8 Hardening:** The environment sets `PYTHONIOENCODING=utf-8` and `PYTHONUTF8=1` to prevent issues with emojis and non-standard characters crashing the bridge on Windows.
 
 ---
 
-## 3. Core Features & Domains
+## 3. Core Features & Domains (In-Depth)
 
 ### 3.1 ARC-AGI Explainer (Puzzle Analysis & Exploration)
-This domain allows users to browse ARC tasks, generate AI solutions, and evaluate model reasoning.
 
-* **Puzzle Browser & Examiner:** Interactive UIs for viewing input/output grids, test cases, and community/AI explanations.
-* **Puzzle Analyst Mode (`/task/:taskId`):** High-density grid of analyses.
-* **AI Explanations & Predictions:** Generating text explanations and grid predictions using various AI providers.
-* **Model Debate & Rebuttals:**
-  * Allows one AI model to critique or challenge the reasoning of another.
-  * Rebuttal chains are stored chronologically using `rebutting_explanation_id`.
-* **Conversation Chaining (Responses API):** Multi-turn context retention native to the provider (OpenAI o-series, Grok-4). Keeps an AI's previous reasoning steps (via `providerResponseId`) for seamless follow-ups without token waste.
-* **Structured Outputs:** Leverages provider JSON schemas (OpenAI structured outputs, xAI Grok JSON schema) to guarantee strict output formats for puzzle answers.
-* **Streaming Analysis:** Token-by-token output streamed to the client using SSE with a two-step handshake (`POST /api/stream/analyze` -> `GET /api/stream/analyze/:sessionId`).
+**Puzzle Analyst Mode (`/task/:taskId`):**
+A dense, high-data UI grid for researchers to view an ARC task.
+* **Flow:** The UI queries the `ExplanationRepository` for all attempts made on this task. It groups the explanations by model and correctness, rendering input/output grids dynamically.
+
+**Model Debate & Rebuttals:**
+Allows an AI to analyze and critique the incorrect reasoning of another AI.
+* **Data Model:** Explanations have a self-referential `rebutting_explanation_id`.
+* **Flow:** A `POST` request to `/api/puzzle/analyze/:taskId/:model` with "Debate Mode" active takes the original `ExplanationData`, formulates a challenge prompt, and streams the rebuttal.
+* **Recursion:** `/api/explanations/:id/chain` uses a recursive CTE in PostgreSQL to walk the chain of rebuttals back to the original thought.
+
+**Conversation Chaining (Responses API):**
+* **Context Preservation:** Leverages provider-native IDs (OpenAI's o-series, Grok-4) to retain memory without resending massive prompt histories.
+* **Flow:**
+    1. First analysis returns a `providerResponseId`. This is stored in the DB.
+    2. Subsequent requests from the UI (like in the PuzzleDiscussion view) send `previousResponseId`.
+    3. The backend sends this to the provider, instructing the AI to remember its prior reasoning tokens.
+
+**Streaming Analyses (SSE Handshake):**
+* Circumvents URL limits for massive prompts.
+* **Step 1:** Client `POST /api/stream/analyze` with the massive payload. Server caches this using an LRU mapping, returning `{ sessionId, expiresAt }`.
+* **Step 2:** Client opens an `EventSource` (`GET /api/stream/analyze/:taskId/:modelKey/:sessionId`). Server pulls the cached payload, executes the LLM call, and pipes `stream.chunk` events back.
 
 ### 3.2 RE-ARC Bench
-A self-service platform for generating unique ARC evaluation datasets and scoring AI solver submissions. Contributed by the community.
 
-* **Dataset Generation (`/api/rearc/generate`):** Generates cryptographically unique 120-task evaluation datasets natively in Python.
-* **Submission Evaluation (`/api/rearc/evaluate`):** Upload solver submissions (JSON format) and evaluate them against the dataset. Uses an LRU cache for high-speed evaluation.
-* **Scoring Logic Parity:** Faithfully implements the official ARC-AGI scoring algorithm (a test pair is solved if ANY of 2 attempts matches the ground truth).
-* **Leaderboards & Efficiency Plots:** Visualizes model efficiency, tracking how models scale reasoning vs. accuracy.
+A rigorous verification layer built by porting the `arc_agi_benchmarking` Python repository to evaluate synthetic datasets.
+
+**Dataset Generation (`generateDataset`):**
+* **Cryptographic Determinism:** To prevent data leaks, public `seedId`s are provided by users, but the backend derives an `internalSeed` using an HMAC-SHA256 hash with a server-side `RE_ARC_SEED_PEPPER`.
+* **Execution:** Spawns a Python subprocess executing `external/re-arc/lib.py`. It streams JSON definitions of synthetic tasks. The Node backend parses these, caches the true output grids via a `SimpleLRU` cache (`__testOnly_datasetCache`), and yields the tasks *without* outputs to the client as a gzip stream.
+
+**Submission Evaluation (`evaluateSubmission`):**
+* **Decoding:** Reads the submitted JSON. Recovers the `seedId` and `internalSeed` from the obfuscated task IDs using the server pepper.
+* **Caching Strategy:**
+    * **Cache Hit:** If the dataset exists in `__testOnly_datasetCache`, it avoids the expensive Python regeneration entirely.
+    * **Cache Miss:** Re-spawns Python to regenerate the ground-truth outputs silently in the background.
+* **Scoring Algorithm Parity:** Implements `scoreTask(testCases, predictions)`. Mirroring the official ARC-AGI rules, it evaluates: `attempt1Correct = gridsEqual(...) || attempt2Correct = gridsEqual(...)`. A task's total score is solved test cases / total test cases.
+* **Streaming Feedback:** Emits SSE progress events as tasks are evaluated, culminating in a `score` or `mismatches` (if the submission array size doesn't match the test cases).
 
 ### 3.3 Worm Arena & SnakeBench
-A platform for running AI vs. AI "Snake" environment matches.
 
-* **Match Orchestration:** Run single matches (`/api/snakebench/run-match`) or batches between different LLM models.
-* **Live Streaming:** Real-time match playback using SSE (`/api/wormarena/stream/:sessionId`).
-* **Greatest Hits:** Curated library of interesting, high-cost, or extremely long matches.
-* **Metrics & Leaderboards:** TrueSkill algorithm rankings, 30-apple placement distributions, run-length charts, and streaming model insight reports.
+An isolated "Snake" environment for observing LLM planning and spatial reasoning over sequential rounds.
+
+**Match Execution:**
+* Python loops through game rounds, executing LLM inference at each step to determine Snake movement.
+* Database updates occur at every round to track live state.
+
+**Insights Reporting (`WormArenaReportService`):**
+* Orchestrates an LLM-powered summary of a model's performance.
+* **Flow:**
+    1. Aggregates data: win rates, cost, average survival rounds, frequent death causes, and nemesis opponents.
+    2. Constructs a massive context payload and hits the `INSIGHTS_SUMMARY_MODEL` (e.g., `gpt-5-mini`) via the Responses API.
+    3. **Structured Outputs:** Forces the model to respond adhering to a strict JSON schema (`WormArenaModelInsightsSummary`), containing predefined keys like `summary`, `deathAnalysis`, `toughOpponents`, and `recommendations`.
+    4. **Output formatting:** Takes the structured JSON and formats it into a Markdown document and a 280-character Tweet (incorporating variables like `@arcprize` and dynamic URLs).
+* **Streaming:** Implements `streamModelInsightsReport` to provide real-time chunking of the LLM's analytical stream directly into the UI dashboard.
 
 ### 3.4 ARC3 Agent Playground
-Integration for the newly-minted ARC-AGI-3 environment.
 
-* **Playground (`/arc3/playground`):** Watch agents (Codex, OpenRouter, Haiku) solve real ARC-AGI-3 games.
-* **Modular Structure:** `shared/arc3Games/` holds per-game registry files, explicit replays, and metadata.
-* **Community Submissions:** Token-gated moderation system to approve/reject community `.py` submissions for the ARC3 arena.
+A highly modularized approach to ARC-AGI-3 testing.
+* **Data Organization:** Each test environment is isolated inside `shared/arc3Games/`. It maps specific `replays` and metadata rules exclusively for that domain.
+* **Submission Moderation:** Given the execution risk of raw `.py` files, community submissions default to `status='pending'` and require a token-gated `/api/arc3-community/submissions/:id/publish` call by an admin before becoming active in the system.
 
 ---
 
 ## 4. Analytics, Metrics & Cost Tracking
 
-The platform provides an extensive suite of metrics to study model effectiveness transparently:
-
-* **Accuracy Statistics (`/api/feedback/accuracy-stats`):** Pure 1-shot puzzle solving accuracy (excludes debate rebuttals). Provides fair apples-to-apples comparisons.
-* **Debate Accuracy (`/api/feedback/debate-accuracy-stats`):** Success rates specifically for AI challenges/rebuttals.
-* **Model-to-Model Comparison (`/api/metrics/compare`):** Head-to-head performance across specific datasets, showing intersection and union stats.
-* **Cost Tracking (`/api/metrics/costs/*`):** Comprehensive token usage and dollar cost tracking by model, aggregated via the `CostRepository`. Prevents overspending and highlights model efficiency.
-* **Trustworthiness:** Metrics estimating how often a model's self-reported confidence aligns with its actual correctness.
-* **Model Dataset Explorer (`/api/model-dataset/*`):** Dynamically discovers datasets (eval, training, eval2) and queries model success rates against them.
+* **Cost Normalization (`CostRepository`):** Centralizes cost calculation. Strips suffixes (`:free`, `:beta`) to sum true historical spend correctly. Queries hit optimized indexes `(model_name, estimated_cost)`.
+* **Pure Accuracy vs Debate Accuracy:**
+    * `GET /api/feedback/accuracy-stats` filters out rebuttals (`WHERE rebutting_explanation_id IS NULL`) to measure true 1-shot ability.
+    * `GET /api/feedback/debate-accuracy-stats` does the inverse to judge an AI's critical review skills.
+* **Model-to-Model Union Math:** `/api/metrics/compare` analyzes overlap (e.g., did Model A solve what Model B missed?). Supports multi-attempt aggregations (treating `model-attempt1` and `model-attempt2` as a unioned solver to match ARC competition logic).
 
 ---
 
-## 5. Administrative & Maintenance Tools
+## 5. Potential Pitfalls & Areas for Improvement
 
-* **Bring Your Own Key (BYOK):** Production mode enforces user-provided API keys for premium models, ensuring the platform remains free to host.
-* **Dataset Ingestion (`/admin/ingest-hf`):** Tools to pull bulk prediction data from HuggingFace datasets or Johanland into the SQL database.
-* **OpenRouter Discovery:** Scripts to dynamically ingest and synchronize model catalogs from OpenRouter.
+1. **RE-ARC Cache Bloat Risk:**
+   * **Issue:** The `__testOnly_datasetCache` uses a `SimpleLRU` capped at 50 datasets. Since full datasets can be large, high concurrency on different seeds could thrash the cache, resulting in constant Python re-spawns and high latency.
+   * **Improvement:** Migrate the RE-ARC cache to Redis or Memcached if concurrent evaluations scale.
 
----
+2. **Python Subprocess Zombies (`pythonBridge.ts`):**
+   * **Issue:** While `reArcService.ts` has a robust `InactivityTimeoutManager`, the general `PythonBridge` executing long-running visual solvers (like Saturn) lacks a strict internal inactivity timeout. If Python hangs without crashing, the Node promise will hang indefinitely.
+   * **Improvement:** Implement standard timeout/kill logic across all `spawn()` instances in `pythonBridge.ts`.
 
-## 6. Verification & Implementation Notes
+3. **Data Leakage in OpenRouter Discovery:**
+   * **Issue:** Admin ingestion endpoints auto-sync models from HuggingFace and OpenRouter. If bad actors upload maliciously formatted dataset keys on HuggingFace, it could corrupt internal DB tracking IDs.
+   * **Improvement:** Ensure stringent Zod validation occurs *before* database insertion during `ingest-hf` scripts.
 
-### Correctness and Scoring (Critical Implementation Detail)
-The TypeScript implementation of the RE-ARC evaluation strictly mirrors the Python equivalent (`arc_agi_benchmarking/scoring/scoring.py`).
-* **Rule:** A task's test case is marked correct if either `attempt_1` OR `attempt_2` matches the exact output grid.
-* **Note on Verification:** Currently, the TypeScript backend performs identity/equality grid matching. If future RE-ARC tasks utilize non-identity custom verification rules, the evaluation must be shifted entirely to the Python subprocess verifiers.
-
-### Streaming Architecture
-The platform utilizes a robust SSE (Server-Sent Events) mechanism for analyses and live game arenas.
-* **Handshake Protocol:** The client first sends a `POST` request to prime the server, which caches the payload and returns a `sessionId`. The client then opens an `EventSource` (`GET`) with that ID. This circumvents URL length limits for complex prompt payloads.
-
-### UI Principles
-* UIs are designed to be dynamic. Long-running configuration panels (e.g., Debate, Streaming runs) must organically collapse or disable themselves once processing begins, replacing static views with live-streaming states.
+4. **Structured JSON Fallbacks:**
+   * **Issue:** Currently, if `output_parsed` is missing during Insights generation, `WormArenaReportService` attempts a raw `JSON.parse(llmSummary)`. If the LLM generates markdown wrapped JSON (e.g. ` ```json {...} ``` `), the parse will throw.
+   * **Improvement:** Add a regex sanitizer to strip markdown code blocks from the raw `output_text` before falling back to `JSON.parse`.
 
 ---
-
-## 7. Analysis of Potential Issues & Areas for Improvement
-
-Based on a deep review of the codebase documentation (`AGENTS.md`, `CLAUDE.md`, and `EXTERNAL_API.md`), here are potential areas where implementations might go wrong or could be improved:
-
-1. **RE-ARC Scoring Single Source of Truth:**
-   * **Issue:** Currently, TypeScript manually compares grids for RE-ARC evaluation (`reArcService.ts:scoreTask()`). While this works for identity-based tasks, it breaks the DRY principle regarding the official Python scoring library.
-   * **Improvement:** The system should be refactored to delegate all RE-ARC scoring directly to the Python subprocess (`external/re-arc/verifiers.py`). This future-proofs the app for complex task types.
-
-2. **Database Auto-migration Risks:**
-   * **Issue:** Running `drizzle-kit push` auto-creates/modifies tables. Since `public.games` (SnakeBench) and ARC data are intimately linked but sometimes lack local file parity (e.g., Greatest Hits without local JSON replays), destructive migrations could orphan data.
-   * **Improvement:** Use versioned SQL migrations (`drizzle-kit generate` followed by `drizzle-kit migrate`) for production rather than `db:push`.
-
-3. **OpenAI Responses API Handshake Complexity:**
-   * **Issue:** The custom `POST` -> `GET` SSE handshake requires careful payload caching. If the cache is not cleared correctly upon sudden client disconnects, it could cause memory leaks.
-   * **Improvement:** Ensure aggressive garbage collection and hard TTLs on the cached SSE payloads in `storage.ts`.
-
-4. **Structured Outputs Strictness:**
-   * **Issue:** xAI's Grok API occasionally chokes on strict JSON schema definitions.
-   * **Mitigation (Already Implemented, but fragile):** The system catches `400/422/503` errors and retries without a schema, falling back to text parsing. This parsing logic must be heavily unit-tested.
-
-5. **N+1 Query Problems in Debate Chains:**
-   * **Issue:** Querying debate chains (`GET /api/explanations/:id/chain`) relies on recursive CTEs in PostgreSQL. Deep chains might become expensive to compute.
-   * **Improvement:** Cache debate chains or denormalize the root explanation ID to avoid recursive lookups on read-heavy paths.
-
-6. **Worm Arena State Duplication:**
-   * **Issue:** Python emits per-round SnakeBench logs, but Express wraps this into SSE. If Express and Python lose sync, the UI might show a completed match without final DB writes.
-   * **Improvement:** Ensure atomic transactions when Python completes a match and Express records the result in the `GameWriteRepository`.
-
----
-*End of Feature Specification Document*
+*End of In-Depth Feature Specification Document*
