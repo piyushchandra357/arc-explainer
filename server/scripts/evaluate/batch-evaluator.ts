@@ -56,10 +56,11 @@ interface EvaluationState {
   completedRuns: Set<string>; // Set of `${puzzleId}_${modelSlug}_${runIndex}`
   circuitBreakers: Record<string, { failures: number; suspendedUntil: number }>;
   isDraining: boolean;
+  runSummaries: any[]; // Stores results for CSV and Chart generation at the end
 }
 
 const DEFAULT_CONFIG: EvaluationConfig = {
-  runId: randomUUID(),
+  runId: '', // Will be assigned during initialization
   puzzleIds: [],
   models: [],
   runsPerModel: 1,
@@ -93,30 +94,66 @@ class EvaluationOrchestrator {
       completedRuns: new Set(),
       circuitBreakers: {},
       isDraining: false,
+      runSummaries: [],
     };
     this.cancelDir = path.join(this.config.outputDir, 'cancel');
   }
 
-  async initialize() {
+  private findLatestSession(): string | null {
+    if (!fs.existsSync(this.config.outputDir)) return null;
+    const files = fs.readdirSync(this.config.outputDir);
+    const summaryFiles = files.filter(f => f.startsWith('summary_') && f.endsWith('.jsonl'));
+    if (summaryFiles.length === 0) return null;
+
+    // Sort by modified time descending to find the latest
+    summaryFiles.sort((a, b) => {
+      const statA = fs.statSync(path.join(this.config.outputDir, a));
+      const statB = fs.statSync(path.join(this.config.outputDir, b));
+      return statB.mtimeMs - statA.mtimeMs;
+    });
+
+    const latestFile = summaryFiles[0];
+    const match = latestFile.match(/summary_(.+)\.jsonl/);
+    return match ? match[1] : null;
+  }
+
+  async initialize(forceNewRun: boolean = false) {
     // 1. Create Directories
     fs.mkdirSync(this.config.outputDir, { recursive: true });
     fs.mkdirSync(this.cancelDir, { recursive: true });
 
-    // 2. Setup Logging Files (Atomic Append)
+    // 2. Crash Recovery & Session Discovery
+    if (!forceNewRun && !this.config.runId) {
+      const latestSession = this.findLatestSession();
+      if (latestSession) {
+        this.config.runId = latestSession;
+        logger.info(`[Evaluator] Found interrupted session. Resuming run: ${this.config.runId}`);
+      }
+    }
+
+    // Generate new UUID if no session found or explicitly requesting a new one
+    if (!this.config.runId) {
+      this.config.runId = randomUUID();
+      logger.info(`[Evaluator] Starting new evaluation session: ${this.config.runId}`);
+    }
+
+    // 3. Setup Logging Files (Atomic Append)
     const runLogPath = path.join(this.config.outputDir, `run_${this.config.runId}.jsonl`);
     const summaryPath = path.join(this.config.outputDir, `summary_${this.config.runId}.jsonl`);
 
     this.logStream = fs.createWriteStream(runLogPath, { flags: 'a' });
     this.summaryStream = fs.createWriteStream(summaryPath, { flags: 'a' });
 
-    // 3. Crash Recovery & Resume
+    // 4. Read previous summary file to skip completed runs
     await this.recoverState(summaryPath);
 
-    // 4. Setup Signal Listeners for Graceful Shutdown
+    // 5. Setup Signal Listeners for Graceful Shutdown
     process.on('SIGINT', () => this.handleShutdown('SIGINT (Ctrl+C)'));
     process.on('SIGTERM', () => this.handleShutdown('SIGTERM'));
 
-    logger.info(`[Evaluator] Initialized Run: ${this.config.runId}`);
+    this.logStream = fs.createWriteStream(runLogPath, { flags: 'a' });
+    this.summaryStream = fs.createWriteStream(summaryPath, { flags: 'a' });
+
     logger.info(`[Evaluator] Recovered ${this.state.completedRuns.size} completed runs.`);
   }
 
@@ -259,7 +296,7 @@ class EvaluationOrchestrator {
       return;
     }
 
-    // Ensure AI Factory is initialized
+    // Ensure AI Factory is initialized (this method exists on the actual aiServiceFactory singleton instance, despite simplified doc specs)
     if (aiServiceFactory.initialize) {
       await aiServiceFactory.initialize();
     }
@@ -281,7 +318,83 @@ class EvaluationOrchestrator {
     if (this.logStream) this.logStream.end();
     if (this.summaryStream) this.summaryStream.end();
 
+    // Generate Final Reports (CSV and Visualizations)
+    this.generateCsvReport();
+    this.generateHtmlVisualization();
+
     logger.info(`[Evaluator] Evaluation Session Finished. Total Cost: $${this.state.totalCostUsd.toFixed(4)}`);
+  }
+
+  // ============================================================================
+  // Reporting & Visualization
+  // ============================================================================
+
+  private generateCsvReport() {
+    if (this.state.runSummaries.length === 0) return;
+
+    const csvPath = path.join(this.config.outputDir, `results_${this.config.runId}.csv`);
+    const headers = ['Timestamp', 'RunID', 'Model', 'Puzzle', 'Status', 'Score', 'Cost', 'Tokens(In)', 'Tokens(Out)', 'Tokens(Reasoning)', 'Tokens(Cached)'];
+
+    const rows = this.state.runSummaries.map(r =>
+      `${r.timestamp},${r.runId},${r.modelSlug},${r.puzzleId},${r.status},${r.score.toFixed(3)},${r.costUsd.toFixed(4)},${r.tokensIn || 0},${r.tokensOut || 0},${r.tokensReasoning || 0},${r.tokensCached || 0}`
+    );
+
+    fs.writeFileSync(csvPath, [headers.join(','), ...rows].join('\n'));
+    logger.info(`[Evaluator] Saved CSV Report: ${csvPath}`);
+  }
+
+  private generateHtmlVisualization() {
+    if (this.state.runSummaries.length === 0) return;
+    const htmlPath = path.join(this.config.outputDir, `visualize_${this.config.runId}.html`);
+
+    // Generate a standalone HTML file using Chart.js via CDN to plot "Score vs Cost" scatter plots
+    const data = JSON.stringify(this.state.runSummaries.map(r => ({
+      x: r.costUsd,
+      y: r.score,
+      label: `${r.modelSlug} (${r.puzzleId})`
+    })));
+
+    const htmlContent = `
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ARC Evaluation Visualization</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>body { background: #111; color: #fff; font-family: sans-serif; padding: 20px; }</style>
+</head>
+<body>
+  <h2>Score vs Cost Analysis</h2>
+  <div style="width: 800px; height: 600px;"><canvas id="chart"></canvas></div>
+  <script>
+    const rawData = ${data};
+    new Chart(document.getElementById('chart'), {
+      type: 'scatter',
+      data: {
+        datasets: [{
+          label: 'Model Runs',
+          data: rawData,
+          backgroundColor: 'rgba(75, 192, 192, 0.6)',
+          borderColor: 'rgba(75, 192, 192, 1)',
+        }]
+      },
+      options: {
+        scales: {
+          x: { title: { display: true, text: 'Cost (USD)', color: '#aaa' }, grid: { color: '#333' }, ticks: { color: '#ccc' } },
+          y: { title: { display: true, text: 'ARC-2 Score', color: '#aaa' }, min: 0, max: 1, grid: { color: '#333' }, ticks: { color: '#ccc' } }
+        },
+        plugins: {
+          tooltip: {
+            callbacks: { label: (ctx) => rawData[ctx.dataIndex].label + ': Score ' + ctx.raw.y + ' @ $' + ctx.raw.x }
+          }
+        }
+      }
+    });
+  </script>
+</body>
+</html>
+    `;
+    fs.writeFileSync(htmlPath, htmlContent);
+    logger.info(`[Evaluator] Saved Visualization HTML: ${htmlPath}`);
   }
 
   private async evaluatePuzzle(puzzleId: string) {
@@ -336,17 +449,19 @@ class EvaluationOrchestrator {
     this.logEvent('run_start', { puzzleId, modelSlug: model.modelSlug, runIndex });
     logger.info(`[Evaluator] Running [${runKey}]...`);
 
+    // getService and analyzePuzzleWithModel are the actual signatures in server/services/base/BaseAIService.ts
     const service = aiServiceFactory.getService(model.modelSlug);
     let attemptCost = 0;
     let success = false;
     let finalScore = 0;
     let notepad = ""; // Persistent Scratchpad
+    let conversationHistory: string[] = []; // Sliding Window Context Tracker
+    let response: any = null; // Declare outside try block for summary record access
 
     try {
       // Retry Logic with Exponential Backoff
       let retries = 0;
-      let response = null;
-      while (retries < 5) {
+      while (retries < 50) {
         try {
           // 3. Execution (Supports ARC2 Grid Format currently; ARC3 requires long-lived runner integration)
           let basePrompt = buildAnalysisPrompt('solver', task);
@@ -355,6 +470,11 @@ class EvaluationOrchestrator {
           // Inject Notepad if it exists (Self-Correction loop simulation)
           if (notepad) {
             finalPrompt += `\n\n[Persistent Notepad / Self-Correction]:\n${notepad}\n`;
+          }
+
+          // Append past conversation history (Sliding Context Window Feature 13)
+          if (conversationHistory.length > 0) {
+             finalPrompt += `\n\n[Previous Turns]:\n${conversationHistory.join('\n---\n')}\n`;
           }
 
           response = await service.analyzePuzzleWithModel(
@@ -372,6 +492,11 @@ class EvaluationOrchestrator {
           );
 
           this.recordSuccess(model.provider);
+
+          // Update sliding context window for success
+          conversationHistory.push(`User: Attempted prediction.\nAI: ${response.predictedOutput}`);
+          if (conversationHistory.length > 50) conversationHistory.shift(); // Keep only last 50 turns
+
           break; // Success, exit retry loop
 
         } catch (err: any) {
@@ -381,6 +506,11 @@ class EvaluationOrchestrator {
           if (err.message.includes('Invalid JSON') || err.message.includes('parse')) {
              logger.warn(`[Evaluator] [${runKey}] Parse error. Applying Self-Correction...`);
              notepad += `\nAttempt ${retries+1} Failed: Your output was not valid JSON. Ensure you use [[x,y]] format.`;
+
+             // Update sliding window even on failure
+             conversationHistory.push(`User: Your output failed validation.\nAI: [Failed Output Omitted]`);
+             if (conversationHistory.length > 50) conversationHistory.shift();
+
              retries++;
              continue;
           }
@@ -404,7 +534,7 @@ class EvaluationOrchestrator {
       }
 
       if (!response) {
-        throw new Error(`Exceeded maximum retries (5) for ${runKey}`);
+        throw new Error(`Exceeded maximum retries (50) for ${runKey}`);
       }
 
       // 4. Update Costs & State
@@ -433,12 +563,17 @@ class EvaluationOrchestrator {
 
     // 5. Finalize Run & Write Atomic Summary
     const summaryRecord = {
+      runId: runKey,
       puzzleId,
       modelSlug: model.modelSlug,
       runIndex,
       status: success ? 'completed' : 'failed',
       score: finalScore,
       costUsd: attemptCost,
+      tokensIn: response?.inputTokens || 0,
+      tokensOut: response?.outputTokens || 0,
+      tokensReasoning: response?.reasoningTokens || 0,
+      tokensCached: response?.cachedTokens || 0,
       timestamp: new Date().toISOString()
     };
 
@@ -446,6 +581,7 @@ class EvaluationOrchestrator {
       this.summaryStream.write(JSON.stringify(summaryRecord) + '\n');
     }
 
+    this.state.runSummaries.push(summaryRecord);
     this.state.completedRuns.add(runKey);
     this.logEvent('run_end', summaryRecord);
   }
@@ -485,24 +621,50 @@ async function main() {
   }
 }
 
+function parseArgs() {
+  const args = process.argv.slice(2);
+  const config: Partial<EvaluationConfig> = {};
+  let forceNewRun = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--new') forceNewRun = true;
+    else if (arg === '--dry-run') config.dryRun = true;
+    else if (arg === '--stdout-jsonl') config.stdoutJsonl = true;
+    else if (arg === '--runs' && i + 1 < args.length) config.runsPerModel = parseInt(args[++i], 10);
+    else if (arg === '--max-steps' && i + 1 < args.length) config.maxSteps = parseInt(args[++i], 10);
+    else if (arg === '--budget' && i + 1 < args.length) config.globalBudgetUsd = parseFloat(args[++i]);
+    else if (arg === '--puzzles' && i + 1 < args.length) config.puzzleIds = args[++i].split(',');
+    else if (arg === '--model' && i + 1 < args.length) {
+      if (!config.models) config.models = [];
+      const modelArg = args[++i];
+      const provider = modelArg.split('/')[0] || 'unknown';
+      config.models.push({ provider, modelSlug: modelArg });
+    }
+  }
+
+  return { config, forceNewRun };
+}
+
 // Auto-execute if run directly
 import { fileURLToPath } from 'url';
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  // Add some mock data to verify execution loop correctly steps through the array chunking
-  const mockConfig = {
-    ...DEFAULT_CONFIG,
-    puzzleIds: ['00d62c1b', '017c7c7b'],
-    models: [
-      { provider: 'openai', modelSlug: 'gpt-4o', reasoningEffort: 'low' as const },
-      { provider: 'anthropic', modelSlug: 'claude-3.5-sonnet' }
-    ],
-    runsPerModel: 2,
-    maxConcurrentRuns: 2,
-    dryRun: false // Toggle to false to execute an actual API call test
-  };
+  const { config, forceNewRun } = parseArgs();
 
-  const orchestrator = new EvaluationOrchestrator(mockConfig);
-  orchestrator.initialize().then(() => orchestrator.run());
+  // Default fallbacks if CLI args aren't provided for testing
+  if (!config.puzzleIds || config.puzzleIds.length === 0) {
+    config.puzzleIds = ['00d62c1b', '017c7c7b'];
+  }
+  if (!config.models || config.models.length === 0) {
+    config.models = [
+      { provider: 'openai', modelSlug: 'openai/gpt-4o', reasoningEffort: 'low' as const },
+      { provider: 'anthropic', modelSlug: 'anthropic/claude-3.5-sonnet' }
+    ];
+  }
+
+  const finalConfig = { ...DEFAULT_CONFIG, ...config };
+  const orchestrator = new EvaluationOrchestrator(finalConfig);
+  orchestrator.initialize(forceNewRun).then(() => orchestrator.run());
 }
 
 export { EvaluationOrchestrator, EvaluationConfig, ModelConfig };
