@@ -1169,3 +1169,74 @@ SnakeBench is the primary environment used in "Worm Arena" to test the spatial r
 
 ---
 *Final End of Master Feature & Technical Specification Blueprint*
+
+## 42. Appendix U: The Python Evaluation Harness (`scripts/evaluate/`)
+
+The evaluation harness answers the fundamental question: **"How well can an AI model solve ARC puzzles?"** It serves as a robust, production-grade testbed for running ARC-AGI-2 and ARC-AGI-3 puzzles against multiple models simultaneously while precisely tracking performance, costs, and reasoning strategies.
+
+### 42.1 Multi-Model & Parallel Execution
+**Purpose:** To compare AI performance rapidly and at scale without waiting for sequential runs.
+**Internal Workings:**
+*   **Scale:** Supports 18 distinct model configurations across 6 AI providers (Google Gemini, OpenAI GPT-5.4, Anthropic Claude, AWS Bedrock, Moonshot Kimi, OpenRouter).
+*   **Three-Tier Parallelism:** The harness executes concurrently at three levels:
+    1.  Multiple *puzzles* simultaneously (up to 20).
+    2.  Multiple *models* tackling the exact same puzzle simultaneously.
+    3.  Multiple *attempts* (runs) per model simultaneously (up to 10).
+*   **Result:** A 5-puzzle, 4-model, 3-attempt experiment executes 60 distinct evaluation runs concurrently.
+
+### 42.2 Multi-Format Support
+**Purpose:** To seamlessly evaluate models on both generation of ARC puzzles.
+**Internal Workings:**
+*   **ARC-AGI-3 (Interactive):** The AI acts as an agent navigating a game environment using cursor movements, clicking, and level resets. Scoring is calculated as `levels completed / total levels`.
+*   **ARC-AGI-2 (Grid Tasks):** The AI analyzes training pairs to build the final output grid. Scoring is granular (`correct cells / total cells`), tracking progress step-by-step rather than just pass/fail.
+
+### 42.3 Budget Controls & Cost Tracking
+**Purpose:** AI evaluations at scale are incredibly expensive. The harness prevents catastrophic billing overruns.
+**Internal Workings:**
+*   **Granular Metering:** Every API call tracks Input, Output, Reasoning, and Cached tokens.
+*   **Caps:** Supports global total spend caps and strict per-puzzle budgets. If a limit is breached, the evaluation terminates gracefully without wasting further resources.
+*   **Tooling:** Includes a standalone cost estimation tool to project the financial impact of a run before execution.
+
+### 42.4 Resilience: Crash Recovery & Circuit Breakers
+**Purpose:** To ensure long-running, expensive evaluations survive network drops, API outages, or manual interruptions.
+**Internal Workings:**
+*   **Automatic Resume:** Upon restart, the harness identifies the most recent session, detects which specific runs completed successfully, and skips them. It cleans up partial writes to prevent JSONL corruption.
+*   **Intelligent Retries:**
+    *   *Rate Limits:* Pauses execution until the next minute boundary (with a randomized jitter to prevent thundering herd API stampedes).
+    *   *Exponential Backoff:* Scales delays up to 5 minutes for general errors (up to 50 retries).
+*   **Circuit Breakers:** If an AI provider fails 10 consecutive times, the harness temporarily suspends requests to that provider for 5 minutes. It then allows a single "probe" request; if successful, normal operation resumes.
+
+### 42.5 Graceful Shutdown Mechanisms
+**Purpose:** Safely interrupt the parallel test matrix without corrupting in-flight data writes.
+**Internal Workings:**
+*   **Signals:** Listens for `Ctrl+C` to drain the current step.
+*   **File-based Cancellation:**
+    *   Dropping a `CANCEL_ALL` file stops the entire evaluation.
+    *   Dropping `CANCEL_{puzzle_name}` stops a specific puzzle.
+    *   Dropping `CANCEL_{puzzle}_{model}` targets a specific permutation.
+
+### 42.6 Context & Memory Management
+**Purpose:** To prevent the AI's context window from overflowing during deep, multi-turn exploration.
+**Internal Workings:**
+*   **Sliding Window:** Limits the model's view to the N most recent conversation turns (default: 50).
+*   **Budget Trimming:** Aggressively drops the oldest exchanges (keeping a 10% safety margin) to respect hard token limits.
+*   **Persistent Scratchpad:** Each model is granted a 4,000-character "Notepad" that survives context trimming, allowing the model to write down strategies and hypotheses that persist for the duration of the run.
+
+### 42.7 Real-Time Event Streaming (`--stdout-jsonl`)
+**Purpose:** To bridge the Python evaluation harness back to the Node.js TypeScript web server.
+**Internal Workings:**
+When launched in "bridge mode", the harness suppresses standard logs and strictly emits NDJSON events:
+*   `session_start`: Evaluation began.
+*   `run_start` / `run_end`: Specific permutation lifecycle.
+*   `step`: The model took an action (lightweight summary to prevent UI bloat).
+*   `session_end`: Final exit status.
+These events flow through the `PythonBridge` and are broadcast to the React frontend via Server-Sent Events (SSE).
+
+### 42.8 Data Integrity & Output Generation
+**Purpose:** To preserve the exact thought process of the AI for post-game analysis.
+**Internal Workings:**
+*   **Thread-Safe I/O:** Uses atomic temp files, rename operations, and file locks to prevent interleaved writes from concurrent threads.
+*   **Outputs:** Generates step-by-step logs (JSONL), complete conversation trajectories (JSONL), token usage spreadsheets (CSV), and automated visualizations (PNG charts for "Score Over Steps" and "Score vs Cost" scatter plots).
+
+---
+*Final End of Master Feature & Technical Specification Blueprint*
